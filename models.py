@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 
@@ -8,34 +7,50 @@ class Generator(nn.Module):
         super().__init__()
         self.nz = nz
         self.n_classes = n_classes
-        self.embed = nn.Embedding(n_classes, n_classes)  # one-hot like
+        
+        # Usar n_classes como dimensão de embedding é um pouco estranho,
+        # mas vamos manter para consistência.
+        self.embed = nn.Embedding(n_classes, n_classes)
 
-        # We concatenate z with class one-hot -> nz + n_classes
+        # We concatenate z with class embedding -> nz + n_classes
         in_dim = nz + n_classes
 
-        # Map to (ngf*4, 6, 6) so that two doublings reach 24 and then 48
+        # Map to (ngf*4, 6, 6)
         self.fc = nn.Sequential(
             nn.Linear(in_dim, ngf*4*6*6, bias=False),
             nn.BatchNorm1d(ngf*4*6*6),
             nn.ReLU(True)
         )
 
+        # ====================================================================
+        # CORREÇÃO 1: Substituído ConvTranspose2d por Upsample + Conv2d
+        # Isso elimina os artefatos de "QR code" (checkerboard).
+        # ====================================================================
         self.net = nn.Sequential(
-            # (ngf*4, 6, 6) -> (ngf*2, 12, 12)
-            nn.ConvTranspose2d(ngf*4, ngf*2, 4, 2, 1, bias=False),
+            # (ngf*4, 6, 6) -> (ngf*4, 12, 12)
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            # -> (ngf*2, 12, 12)
+            nn.Conv2d(ngf*4, ngf*2, 3, 1, 1, bias=False), # K=3,S=1,P=1 preserva tamanho
             nn.BatchNorm2d(ngf*2),
             nn.ReLU(True),
+            
+            # -> (ngf*2, 24, 24)
+            nn.Upsample(scale_factor=2, mode='nearest'),
             # -> (ngf, 24, 24)
-            nn.ConvTranspose2d(ngf*2, ngf, 4, 2, 1, bias=False),
+            nn.Conv2d(ngf*2, ngf, 3, 1, 1, bias=False),
             nn.BatchNorm2d(ngf),
             nn.ReLU(True),
+
+            # -> (ngf, 48, 48)
+            nn.Upsample(scale_factor=2, mode='nearest'),
             # -> (ngf//2, 48, 48)
-            nn.ConvTranspose2d(ngf, ngf//2, 4, 2, 1, bias=False),
+            nn.Conv2d(ngf, ngf//2, 3, 1, 1, bias=False),
             nn.BatchNorm2d(ngf//2),
             nn.ReLU(True),
+            
             # -> (1, 48, 48)
             nn.Conv2d(ngf//2, 1, 3, 1, 1, bias=False),
-            nn.Tanh()
+            nn.Tanh() # Mapeia para [-1, 1]
         )
 
     def forward(self, z, labels):
@@ -43,7 +58,7 @@ class Generator(nn.Module):
         y = self.embed(labels)                       # (B, n_classes)
         x = torch.cat([z, y], dim=1)                 # (B, nz+n_classes)
         x = self.fc(x)                               # (B, ngf*4*6*6)
-        x = x.view(x.size(0), -1, 6, 6)
+        x = x.view(x.size(0), -1, 6, 6)              # Reshape to (B, ngf*4, 6, 6)
         x = self.net(x)                              # (B, 1, 48, 48)
         return x
 
@@ -54,28 +69,55 @@ class Discriminator(nn.Module):
         self.n_classes = n_classes
         self.embed = nn.Embedding(n_classes, n_classes)
 
-        # Spatially concatenate a class map [n_classes x H x W] to the image (1 x H x W)
-        # So input channels = 1 + n_classes
-        in_channels = 1 + n_classes
+        # ====================================================================
+        # CORREÇÃO 2: A rede é dividida.
+        # 1. O 'conv_stack' processa APENAS a imagem.
+        # 2. O 'final_conv' processa as features combinadas.
+        # ====================================================================
 
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, ndf, 4, 2, 1, bias=False),   # 48 -> 24
+        # 1. Pilha de convolução da imagem (entrada 1x48x48)
+        self.conv_stack = nn.Sequential(
+            # (1, 48, 48) -> (ndf, 24, 24)
+            nn.Conv2d(1, ndf, 4, 2, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False),         # 24 -> 12
+            # -> (ndf*2, 12, 12)
+            nn.Conv2d(ndf, ndf*2, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ndf*2),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False),       # 12 -> 6
+            # -> (ndf*4, 6, 6)
+            nn.Conv2d(ndf*2, ndf*4, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ndf*4),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(ndf*4, 1, 6, 1, 0, bias=False),           # 6 -> 1
+        )
+
+        # 2. Convolução final (classificador)
+        # A entrada será (ndf*4) da imagem + (n_classes) do label
+        in_channels_final = ndf*4 + n_classes
+        self.final_conv = nn.Sequential(
+            # -> (1, 1, 1)
+            nn.Conv2d(in_channels_final, 1, 6, 1, 0, bias=False),
             nn.Sigmoid()
         )
 
     def forward(self, x, labels):
         # x: (B,1,48,48); labels: (B,)
-        y = self.embed(labels)               # (B, n_classes)
-        y = y.unsqueeze(-1).unsqueeze(-1)    # (B, n_classes, 1, 1)
-        y = y.expand(-1, -1, x.size(2), x.size(3))  # (B, n_classes, H, W)
-        x = torch.cat([x, y], dim=1)         # (B, 1+n_classes, H, W)
-        out = self.net(x)                    # (B,1,1,1)
+        
+        # 1. Processa a imagem para extrair features
+        # (B, 1, 48, 48) -> (B, ndf*4, 6, 6)
+        img_features = self.conv_stack(x)
+        
+        # 2. Processa o label para corresponder ao tamanho das features
+        # (B,) -> (B, n_classes)
+        y = self.embed(labels)
+        # (B, n_classes) -> (B, n_classes, 1, 1)
+        y = y.unsqueeze(-1).unsqueeze(-1)
+        # (B, n_classes, 1, 1) -> (B, n_classes, 6, 6)
+        y = y.expand(-1, -1, 6, 6)
+        
+        # 3. Concatena features da imagem e do label
+        # (B, ndf*4, 6, 6) + (B, n_classes, 6, 6) -> (B, ndf*4 + n_classes, 6, 6)
+        x = torch.cat([img_features, y], dim=1)
+        
+        # 4. Classifica
+        out = self.final_conv(x) # (B,1,1,1)
         return out.view(-1, 1)
