@@ -6,11 +6,9 @@ import numpy as np
 from PIL import Image
 
 def denorm(x):
-    # x in [-1,1] -> [0,1]
     return (x + 1.0) / 2.0
 
 def save_image_grid(tensor, path, nrow=8):
-    # Save a grid of images (1xHxW) in [-1,1] to disk.
     x = denorm(tensor.detach().cpu().clamp(-1,1))
     b, c, h, w = x.shape
     nrow = min(nrow, b)

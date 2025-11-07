@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+import random
 
 DEFAULT_LABELS = ['angry','disgust','fear','happy','neutral','sad','surprise']
 
@@ -39,44 +40,23 @@ class FERFolder(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        path, y = self.samples[idx]
-        img = Image.open(path).convert('L')
-        img = self.transform(img)  # (1, H, W) in [-1,1]
-        return img, y
-
-class FERCsv(Dataset):
-    """Kaggle fer2013.csv loader: columns = [emotion, pixels, Usage]."""
-    def __init__(self, csv_path: str, usage: str='Training', labels: Optional[List[str]]=None, img_size: int=48):
-        self.csv_path = csv_path
-        self.usage = usage
-        self.labels = labels or DEFAULT_LABELS
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])
-        self.img_size = img_size
-        self._load()
-
-    def _load(self):
-        self.data = []
-        with open(self.csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['Usage'] != self.usage:
-                    continue
-                emotion_idx = int(row['emotion'])
-                pixels = np.fromstring(row['pixels'], dtype=np.uint8, sep=' ')
-                img = pixels.reshape(48,48)
-                self.data.append((img, emotion_idx))
-
-        if len(self.data)==0:
-            raise RuntimeError(f"No rows for Usage='{self.usage}' in {self.csv_path}")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img, y = self.data[idx]
-        img = Image.fromarray(img, mode='L').resize((self.img_size, self.img_size))
-        img = self.transform(img) # (1,H,W) in [-1,1]
-        return img, y
+        # Loop para garantir que uma imagem válida seja retornada
+        while True:
+            path, y = self.samples[idx]
+            try:
+                # Tenta abrir e carregar a imagem
+                img = Image.open(path).convert('L')
+                
+                # Aplica a transformação
+                img = self.transform(img)  # (1, H, W) in [-1,1]
+                
+                # Se tudo deu certo, retorna a imagem e o label
+                return img, y
+                
+            except Exception as e:
+                # Se falhar (ex: imagem corrompida), imprime um aviso
+                print(f"AVISO: Falha ao carregar {path}. Erro: {e}")
+                print("Tentando carregar uma imagem aleatória substituta...")
+                
+                # Tenta de novo com um índice aleatório
+                idx = random.randint(0, len(self.samples) - 1)

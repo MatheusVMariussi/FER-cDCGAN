@@ -12,12 +12,10 @@ from torchvision.utils import save_image
 from types import SimpleNamespace
 
 from datasets import FERFolder, FERCsv, DEFAULT_LABELS
-from models import Generator, Discriminator  # ou PatchGANDiscriminator
+from models_heavy2 import HeavyGenerator, HeavyDiscriminator
 from utils import ensure_dir
 
-# =============================
-# CONFIGURAÇÃO MELHORADA
-# =============================
+# CONFIGURAÇÃO HEAVY (WGAN-GP)
 CONFIG = {
     # Dados
     'data_root': 'data/fer2013/train',
@@ -26,27 +24,28 @@ CONFIG = {
     'labels': DEFAULT_LABELS,
     'img_size': 48,
 
-    # Treinamento - AJUSTADO
-    'epochs': 300,
-    'batch_size': 128,           # REDUZIDO para melhor estabilidade
-    'lr_g': 1e-4,                # REDUZIDO
-    'lr_d': 2e-4,                # AUMENTADO (D precisa ser mais forte)
-    'beta1': 0.5,
-    'beta2': 0.999,
-    'nz': 100,
-    'ngf': 64,
-    'ndf': 64,
+    # Arquitetura HEAVY
+    'nz': 256,
+    'ngf': 128,
+    'ndf': 128,
     
-    # Técnicas de estabilização
-    'label_smoothing': 0.05,     # REDUZIDO (era 0.1)
-    'label_noise': 0.05,         # Adiciona ruído aos labels
-    'n_critic': 1,               # Treina D 1x por iteração
-    'gradient_penalty': 0.0,     # 0 = desabilitado, 10.0 = GP ativo
+    # Treinamento WGAN-GP
+    'epochs': 500,
+    'batch_size': 64,
+    'lr_g': 1e-4,
+    'lr_d': 1e-4,
+    'beta1': 0.0,            # Betas recomendadas para WGAN
+    'beta2': 0.9,            # Betas recomendadas para WGAN
+    'n_critic': 5,           # Treina D 5x mais que G
+    'gp_weight': 10.0,       # Peso do Gradient Penalty
     
-    # Saídas
-    'out_dir': 'checkpoints',
-    'sample_dir': 'generated',
-    'sample_every': 10,
+    'use_ema': True,
+    'ema_decay': 0.999,
+    
+    # Saidas
+    'out_dir': 'checkpoints_heavy',
+    'sample_dir': 'generated_heavy',
+    'sample_every': 5,
     
     # Reprodutibilidade
     'seed': 42,
@@ -99,9 +98,37 @@ def setup_logging(out_dir):
     
     return logger
 
-def compute_gradient_penalty(D, real_samples, fake_samples, labels, device):
-    """Calcula Gradient Penalty (WGAN-GP)"""
-    alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=device)
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
+        self.backup = {}
+
+def compute_gradient_penalty(D, real_samples, fake_samples, labels):
+    alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=real_samples.device)
     interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
     
     d_interpolates = D(interpolates, labels)
@@ -112,7 +139,7 @@ def compute_gradient_penalty(D, real_samples, fake_samples, labels, device):
         grad_outputs=torch.ones_like(d_interpolates),
         create_graph=True,
         retain_graph=True,
-        only_inputs=True
+        only_inputs=True,
     )[0]
     
     gradients = gradients.view(gradients.size(0), -1)
@@ -126,7 +153,7 @@ def main():
     ensure_dir(args.sample_dir)
     
     logger = setup_logging(args.out_dir)
-    logger.info("=== TREINAMENTO MELHORADO ===")
+    logger.info("=== TREINAMENTO HEAVY WGAN-GP ===")
     logger.info(f"Configuração: {vars(args)}")
 
     seed_all(args.seed)
@@ -136,25 +163,38 @@ def main():
     ds = build_dataset(args)
     n_classes = len(args.labels)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, 
-                       num_workers=4, drop_last=True, pin_memory=True)
+                       num_workers=0, drop_last=True, pin_memory=True)
     logger.info(f"Dataset: {len(ds)} amostras, {n_classes} classes.")
 
-    netG = Generator(nz=args.nz, n_classes=n_classes, ngf=args.ngf, img_size=args.img_size).to(device)
-    netD = Discriminator(n_classes=n_classes, ndf=args.ndf).to(device)
-    # OU use: netD = PatchGANDiscriminator(n_classes=n_classes, ndf=args.ndf).to(device)
+    # Modelos HEAVY
+    netG = HeavyGenerator(nz=args.nz, n_classes=n_classes, ngf=args.ngf, img_size=args.img_size).to(device)
+    netD = HeavyDiscriminator(n_classes=n_classes, ndf=args.ndf).to(device)
+    
+    # Conta parâmetros
+    g_params = sum(p.numel() for p in netG.parameters())
+    d_params = sum(p.numel() for p in netD.parameters())
+    logger.info(f"Generator: {g_params:,} parâmetros ({g_params/1e6:.2f}M)")
+    logger.info(f"Discriminator: {d_params:,} parâmetros ({d_params/1e6:.2f}M)")
 
-    criterion = nn.BCELoss()
+    # Optimizers (Sem BCELoss)
     optimizerD = optim.Adam(netD.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2))
     optimizerG = optim.Adam(netG.parameters(), lr=args.lr_g, betas=(args.beta1, args.beta2))
     
-    # Schedulers para diminuir LR ao longo do tempo
-    schedulerD = optim.lr_scheduler.ExponentialLR(optimizerD, gamma=0.99)
-    schedulerG = optim.lr_scheduler.ExponentialLR(optimizerG, gamma=0.99)
+    # EMA do Generator
+    if args.use_ema:
+        ema = EMA(netG, decay=args.ema_decay)
+        logger.info(f"EMA ativado com decay={args.ema_decay}")
+    
+    # Scheduler
+    schedulerD = optim.lr_scheduler.ExponentialLR(optimizerD, gamma=0.995)
+    schedulerG = optim.lr_scheduler.ExponentialLR(optimizerG, gamma=0.995)
 
     fixed_noise = torch.randn(n_classes*8, args.nz, device=device)
     fixed_labels = torch.tensor([i for i in range(n_classes) for _ in range(8)], device=device)
 
-    logger.info("Iniciando treinamento...")
+    logger.info("Iniciando treinamento HEAVY...")
+    
+    global_step = 0
     
     for epoch in range(1, args.epochs+1):
         netG.train()
@@ -162,8 +202,9 @@ def main():
         
         epoch_d_losses = []
         epoch_g_losses = []
-        epoch_d_real_acc = []
-        epoch_d_fake_acc = []
+        epoch_gp_penalties = []
+        epoch_d_real_scores = []
+        epoch_d_fake_scores = []
 
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
         
@@ -171,114 +212,132 @@ def main():
             real_imgs = real_imgs.to(device)
             labels = labels.to(device)
             bsz = real_imgs.size(0)
+            global_step += 1
 
-            # ==================
-            # Train Discriminator
-            # ==================
-            for _ in range(args.n_critic):
-                netD.zero_grad()
-                
-                # Labels com smoothing e noise
-                real_labels = torch.ones(bsz, 1, device=device) * (1.0 - args.label_smoothing)
-                fake_labels = torch.zeros(bsz, 1, device=device) + args.label_smoothing
-                
-                # Adiciona ruído aos labels ocasionalmente
-                if args.label_noise > 0 and random.random() < args.label_noise:
-                    real_labels, fake_labels = fake_labels, real_labels
-                
-                # Real images
-                out_real = netD(real_imgs, labels)
-                lossD_real = criterion(out_real, real_labels)
-                
-                # Fake images
-                noise = torch.randn(bsz, args.nz, device=device)
-                fake_labels_class = torch.randint(0, n_classes, (bsz,), device=device)
-                fake_imgs = netG(noise, fake_labels_class).detach()
-                out_fake = netD(fake_imgs, fake_labels_class)
-                lossD_fake = criterion(out_fake, fake_labels)
-                
-                # Total D loss
-                lossD = lossD_real + lossD_fake
-                
-                # Gradient Penalty (opcional)
-                if args.gradient_penalty > 0:
-                    gp = compute_gradient_penalty(netD, real_imgs, fake_imgs, fake_labels_class, device)
-                    lossD = lossD + args.gradient_penalty * gp
-                
-                lossD.backward()
-                torch.nn.utils.clip_grad_norm_(netD.parameters(), 1.0)  # Gradient clipping
-                optimizerD.step()
-                
-                # Métricas de acurácia
-                d_real_acc = (out_real > 0.5).float().mean().item()
-                d_fake_acc = (out_fake < 0.5).float().mean().item()
-
-            # ==================
-            # Train Generator
-            # ==================
-            netG.zero_grad()
+            # Trainamento Discriminator
+            netD.zero_grad()
             
+            # Real
+            out_real = netD(real_imgs, labels)
+            lossD_real = -torch.mean(out_real) # WGAN: Quer maximizar D(real) -> minimizar -D(real)
+            
+            # Fake
             noise = torch.randn(bsz, args.nz, device=device)
-            gen_labels = torch.randint(0, n_classes, (bsz,), device=device)
-            fake_imgs = netG(noise, gen_labels)
-            out_gen = netD(fake_imgs, gen_labels)
+            fake_labels_class = torch.randint(0, n_classes, (bsz,), device=device)
+            fake_imgs = netG(noise, fake_labels_class).detach()
             
-            # G quer que D classifique como real
-            lossG = criterion(out_gen, torch.ones(bsz, 1, device=device))
-            lossG.backward()
-            torch.nn.utils.clip_grad_norm_(netG.parameters(), 1.0)
-            optimizerG.step()
+            out_fake = netD(fake_imgs, fake_labels_class)
+            lossD_fake = torch.mean(out_fake) # WGAN: Quer minimizar D(fake)
             
-            # Métricas
-            epoch_d_losses.append(lossD.item())
-            epoch_g_losses.append(lossG.item())
-            epoch_d_real_acc.append(d_real_acc)
-            epoch_d_fake_acc.append(d_fake_acc)
+            # Gradient Penalty (WGAN-GP)
+            gradient_penalty = compute_gradient_penalty(netD, real_imgs, fake_imgs, labels)
             
-            pbar.set_postfix({
-                'D': f"{lossD.item():.3f}",
-                'G': f"{lossG.item():.3f}",
-                'D_real': f"{d_real_acc:.2f}",
-                'D_fake': f"{d_fake_acc:.2f}"
-            })
+            # Total D loss
+            lossD = lossD_real + lossD_fake + (args.gp_weight * gradient_penalty)
+            
+            lossD.backward()
+            optimizerD.step()
+            
+            # Métricas WGAN
+            d_real_score = out_real.mean().item()
+            d_fake_score = out_fake.mean().item()
 
+            # Trainamento Generator
+            lossG = torch.tensor(0.0) # Default se não treinar
+            if global_step % args.n_critic == 0:
+                netG.zero_grad()
+                
+                noise = torch.randn(bsz, args.nz, device=device)
+                gen_labels = torch.randint(0, n_classes, (bsz,), device=device)
+                fake_imgs_gen = netG(noise, gen_labels)
+                out_gen = netD(fake_imgs_gen, gen_labels)
+                
+                # WGAN: Quer maximizar D(fake) -> minimizar -D(fake)
+                lossG = -torch.mean(out_gen)
+                
+                lossG.backward()
+                optimizerG.step()
+                
+                # Update EMA
+                if args.use_ema:
+                    ema.update()
+            
+            # Métricas do Batch
+            epoch_d_losses.append(lossD.item())
+            epoch_gp_penalties.append(gradient_penalty.item())
+            epoch_d_real_scores.append(d_real_score)
+            epoch_d_fake_scores.append(d_fake_score)
+            if (global_step % args.n_critic == 0):
+                epoch_g_losses.append(lossG.item())
+                
+            pbar.set_postfix({
+                    'D_loss': f"{lossD.item():.2f}",
+                    'G_loss': f"{lossG.item():.2f}",
+                    'GP': f"{gradient_penalty.item():.2f}",
+                    'D(real)': f"{d_real_score:.2f}",
+                    'D(fake)': f"{d_fake_score:.2f}"
+            })
+        
         pbar.close()
         
-        # Atualiza learning rates
+        # Atualiza LR
         schedulerD.step()
         schedulerG.step()
         
-        # Estatísticas do epoch
+        # Estatísticas do Epoch
         avg_d_loss = np.mean(epoch_d_losses)
-        avg_g_loss = np.mean(epoch_g_losses)
-        avg_d_real_acc = np.mean(epoch_d_real_acc)
-        avg_d_fake_acc = np.mean(epoch_d_fake_acc)
+        avg_g_loss = np.mean(epoch_g_losses) if len(epoch_g_losses) > 0 else 0.0
+        avg_d_real = np.mean(epoch_d_real_scores)
+        avg_d_fake = np.mean(epoch_d_fake_scores)
+        avg_gp = np.mean(epoch_gp_penalties)
         
         logger.info(
             f"Epoch {epoch}/{args.epochs} | "
-            f"D_loss: {avg_d_loss:.4f} | G_loss: {avg_g_loss:.4f} | "
-            f"D_real_acc: {avg_d_real_acc:.3f} | D_fake_acc: {avg_d_fake_acc:.3f} | "
+            f"D_loss: {avg_d_loss:.3f} | G_loss: {avg_g_loss:.3f} | "
+            f"D(real): {avg_d_real:.3f} | D(fake): {avg_d_fake:.3f} | "
+            f"GP: {avg_gp:.3f} | "
             f"LR_D: {schedulerD.get_last_lr()[0]:.6f} | LR_G: {schedulerG.get_last_lr()[0]:.6f}"
         )
 
         # Salvamento
         if (epoch % args.sample_every) == 0 or epoch == args.epochs:
             logger.info(f"Salvando checkpoint epoch {epoch}...")
+            
+            # Usa EMA para gerar samples
+            if args.use_ema:
+                ema.apply_shadow()
+            
             with torch.no_grad():
                 netG.eval()
                 samples = netG(fixed_noise, fixed_labels).cpu()
                 netG.train()
             
+            if args.use_ema:
+                ema.restore()
+            
             save_path = os.path.join(args.sample_dir, f"samples_epoch_{epoch}.png")
             save_image(samples, save_path, nrow=8, normalize=True, value_range=(-1, 1))
             
-            torch.save({
+            # Salva o checkpoint completo
+            checkpoint = {
                 'epoch': epoch,
                 'netG_state_dict': netG.state_dict(),
                 'netD_state_dict': netD.state_dict(),
                 'optimizerG_state_dict': optimizerG.state_dict(),
                 'optimizerD_state_dict': optimizerD.state_dict(),
-            }, os.path.join(args.out_dir, f"checkpoint_epoch_{epoch}.pth"))
+            }
+            if args.use_ema:
+                checkpoint['ema_shadow'] = ema.shadow
+            
+            torch.save(checkpoint, os.path.join(args.out_dir, f"checkpoint_epoch_{epoch}.pth"))
+            
+            # Salva apenas o gerador para facilitar a geração
+            torch.save(netG.state_dict(), os.path.join(args.out_dir, f"G_epoch_{epoch}.pth"))
+            if args.use_ema:
+                ema.apply_shadow()
+                torch.save(netG.state_dict(), os.path.join(args.out_dir, f"G_ema_epoch_{epoch}.pth"))
+                ema.restore()
+
 
     logger.info("Treinamento concluído!")
 
